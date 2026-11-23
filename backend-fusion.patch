@@ -1,0 +1,1445 @@
+diff --git a/backend/README.md b/backend/README.md
+index a01baa1..aaa38d2 100644
+--- a/backend/README.md
++++ b/backend/README.md
+@@ -13,35 +13,72 @@ API FastAPI de l'agent. Tous les chiffres sont calculés ici, l'agent les expliq
+ 
+     uvicorn app.main:app --reload
+ 
+-Documentation et tests des endpoints : http://localhost:8000/docs
+-Description pour l'agent : http://localhost:8000/openapi.json
++Test des endpoints : http://localhost:8000/docs
++Description complète : http://localhost:8000/openapi.json
++Description pour Copilot Studio (9 outils) : http://localhost:8000/copilot/openapi.json
+ 
+ ## Tests
+ 
+     pip install -r requirements-dev.txt
+     pytest -q
+ 
++## Fichiers
++
++    app/main.py          routes et format des erreurs
++    app/traitement.py    anomalies, net, rapprochement, statistiques, tendances
++    app/explication.py   explications en français (jour, mois)
++    app/fichiers.py      lecture des CSV et Excel
++    app/openapi_copilot.py   OpenAPI 3.0 pour Copilot Studio
++    data/                données chargées au démarrage
++    tests/
++
+ ## Endpoints
+ 
+     GET   /health
+-    GET   /resume                          à appeler en premier
++    GET   /resume                              à appeler en premier
++    GET   /tableau-de-bord                     écran d'accueil en un appel
+     GET   /aerodromes
+-    POST  /donnees                         remplace le CSV de trafic
+-    GET   /controle                        filtres : type, aerodrome
+-    GET   /rapprochement                   filtres : uniquement_ecarts, aerodrome
+-    GET   /stats                           filtres : aerodrome, mois (AAAA-MM)
+-    GET   /tendances                       filtre : aerodrome
+-    POST  /anomalies/{anomalie_id}/decision    corps : {"decision": "corriger" | "conserver"}
++    POST  /donnees                             CSV ou Excel, voir plus bas
++    GET   /lignes                              lignes du CSV avec leurs anomalies, paginées
++    GET   /controle                            filtres : type, aerodrome
++    GET   /rapprochement                       filtres : uniquement_ecarts, aerodrome
++    GET   /stats                               filtres : aerodrome, mois (AAAA-MM)
++    GET   /tendances                           filtre : aerodrome
++    GET   /explication/jour/{aerodrome}/{jour}
++    GET   /explication/mois/{aerodrome}/{mois}
++    POST  /anomalies/{id}/decision             corps : {"decision": "corriger" | "conserver"}
+     GET   /decisions
++    GET   /copilot/openapi.json
++
++Toutes les erreurs ont la forme {"detail": "texte"}.
++
++## Anomalies détectées
++
++    doublon                 ligne exclue du net
++    mouvements_manquants    ligne exclue du net
++    mouvements_negatifs     ligne exclue du net
++    retard_manquant         ligne gardée, ignorée dans la moyenne des retards
++    retard_aberrant         retard hors de 0 à 180 min, signalé
++    pic_atypique            gardé et signalé tant qu'une personne n'a pas décidé
++    creux_atypique          signalé
++    jour_manquant           signalé
++
++Un pic est comparé à la médiane des 31 jours autour de lui, par aérodrome et par sens.
++Avec "corriger", il est remplacé par cette médiane. Avec "conserver", il reste.
++
++## Envoi de données
++
++POST /donnees accepte un CSV ou un Excel (.xlsx). Le trafic, le référentiel et les agrégats sont reconnus
++d'après leurs colonnes, un Excel peut contenir les trois feuilles. Seules les tables trouvées sont remplacées.
++Les décisions humaines sont effacées quand le trafic change.
+ 
+-## Nettoyage
++## Copilot Studio
+ 
+-Lignes retirées du net : doublons, mouvements manquants, mouvements négatifs.
+-Retard manquant : ligne gardée, ignorée dans la moyenne des retards.
+-Pic atypique : gardé et signalé tant qu'une personne n'a pas décidé. Avec "corriger", il est remplacé par la médiane de l'aérodrome.
++Importer http://adresse-publique/copilot/openapi.json. La variable URL_PUBLIQUE fixe l'adresse écrite dans la spec,
++sinon elle est déduite de la requête. La décision humaine n'est pas dans les outils de l'agent, elle passe par l'interface.
+ 
+ ## À savoir
+ 
+ - Données et décisions sont en mémoire, perdues au redémarrage.
+-- Pas d'authentification, CORS ouvert à tous.
++- Pas d'authentification. CORS ouvert à tous, à restreindre avec la variable CORS_ORIGINES (adresses séparées par des virgules).
+ - Copilot Studio ne voit pas localhost : il faut une adresse HTTPS (hébergement ou ngrok).
+diff --git a/backend/app/explication.py b/backend/app/explication.py
+new file mode 100644
+index 0000000..6ce0593
+--- /dev/null
++++ b/backend/app/explication.py
+@@ -0,0 +1,160 @@
++import pandas as pd
++
++from .traitement import construire_net, date_fr, mois_fr, nombre, retard_pondere
++
++ACTIONS = {
++    "pic_atypique": [
++        "Vérifier la valeur à la source (erreur de saisie ou événement réel).",
++        "Décider avec POST /anomalies/{id}/decision : corriger ou conserver.",
++    ],
++    "creux_atypique": ["Vérifier la valeur à la source (panne, fermeture ou erreur de saisie)."],
++    "doublon": ["Supprimer la ligne en double à la source (déjà exclue du net)."],
++    "mouvements_manquants": ["Compléter la valeur à la source."],
++    "mouvements_negatifs": ["Corriger la valeur à la source, un nombre de mouvements ne peut pas être négatif."],
++    "retard_manquant": ["Compléter le retard moyen à la source."],
++    "retard_aberrant": ["Vérifier l'unité (minutes) et la valeur du retard."],
++    "jour_manquant": ["Récupérer les données des jours manquants à la source."],
++}
++
++
++def phrase(texte):
++    return texte if texte.endswith(".") else texte + "."
++
++
++def actions(anomalies):
++    liste = []
++    for a in anomalies:
++        for action in ACTIONS.get(a["type"], []):
++            if action not in liste:
++                liste.append(action)
++    return liste
++
++
++def nom_aerodrome(referentiel, code):
++    noms = referentiel.loc[referentiel["code"] == code, "nom_fictif"]
++    return f"{code} ({noms.iloc[0]})" if not noms.empty else code
++
++
++def phrase_decision(anomalie):
++    decision = anomalie.get("decision")
++    if decision == "corriger":
++        return "Décision humaine : valeur corrigée dans le net."
++    if decision == "conserver":
++        return "Décision humaine : valeur conservée."
++    return "Aucune décision humaine pour l'instant, la valeur reste dans les totaux."
++
++
++def explication_jour(donnees, net, anomalies, referentiel, aerodrome, jour):
++    brut = donnees[(donnees["aerodrome"] == aerodrome) & (donnees["date"] == jour)]
++    if brut.empty:
++        raise LookupError(f"Aucune donnée pour {aerodrome} le {date_fr(jour)}.")
++    du_jour = net[(net["aerodrome"] == aerodrome) & (net["date"] == jour)]
++    total = int(du_jour["nombre_mouvements"].sum())
++    arrivees = int(du_jour.loc[du_jour["type_mouvement"] == "ARRIVEE", "nombre_mouvements"].sum())
++    departs = int(du_jour.loc[du_jour["type_mouvement"] == "DEPART", "nombre_mouvements"].sum())
++    trouvees = [a for a in anomalies if a["aerodrome"] == aerodrome and a["date"] == jour]
++
++    par_jour = net[net["aerodrome"] == aerodrome].groupby("date")["nombre_mouvements"].sum()
++    par_jour.index = pd.to_datetime(par_jour.index)
++    instant = pd.Timestamp(jour)
++    autour = par_jour[(par_jour.index >= instant - pd.Timedelta(days=15))
++                      & (par_jour.index <= instant + pd.Timedelta(days=15))
++                      & (par_jour.index != instant)]
++    habituel = float(autour.median()) if len(autour) >= 5 else None
++    base = referentiel.loc[referentiel["code"] == aerodrome, "base_mouvements_jour"]
++    base_jour = None if base.empty or pd.isna(base.iloc[0]) else int(base.iloc[0])
++
++    phrases = [
++        f"Le {date_fr(jour)}, {nom_aerodrome(referentiel, aerodrome)} compte {total} mouvements "
++        f"({arrivees} arrivées, {departs} départs)."
++    ]
++    rapport = None
++    if habituel:
++        rapport = total / habituel
++        texte = f"Le niveau habituel autour de cette date est d'environ {habituel:.0f} mouvements par jour"
++        if base_jour:
++            texte += f" (référence du référentiel : {base_jour})"
++        if abs(rapport - 1) > 0.25:
++            texte += f". Ce jour-là fait {nombre(rapport)} fois le niveau habituel."
++        else:
++            texte += ". Ce jour-là est dans la norme."
++        phrases.append(texte)
++    retard = retard_pondere(du_jour)
++    if retard is not None:
++        phrases.append(f"Retard moyen : {nombre(retard)} min.")
++
++    effet_mois = None
++    for a in trouvees:
++        phrases.append(phrase(a["detail"]))
++        if a["type"] == "pic_atypique":
++            mois = jour[:7]
++            avant_decision = construire_net(donnees, anomalies, {})
++            total_mois = int(avant_decision[(avant_decision["aerodrome"] == aerodrome) & (avant_decision["mois"] == mois)]["nombre_mouvements"].sum())
++            part = round(100 * a["nombre_mouvements"] / total_mois, 1) if total_mois else 0
++            effet_mois = {"mois": mois, "total_mois": total_mois, "part_du_pic_pct": part}
++            phrases.append(
++                f"Cette ligne représente {nombre(part)} % du total du mois ({mois_fr(mois)}, "
++                f"{total_mois} mouvements pour {aerodrome}). Les données ne permettent pas d'en établir la cause."
++            )
++            phrases.append(phrase_decision(a))
++    if not trouvees:
++        phrases.append("Aucune anomalie ce jour-là.")
++
++    return {
++        "titre": f"{aerodrome}, {date_fr(jour)}",
++        "explication": " ".join(phrases),
++        "chiffres": {
++            "total_mouvements": total,
++            "arrivees": arrivees,
++            "departs": departs,
++            "niveau_habituel": None if habituel is None else round(habituel, 1),
++            "rapport_au_niveau_habituel": None if rapport is None else round(rapport, 2),
++            "base_referentiel_par_jour": base_jour,
++            "retard_moyen_min": retard,
++            "effet_sur_le_mois": effet_mois,
++        },
++        "anomalies": trouvees,
++        "actions_conseillees": actions(trouvees),
++    }
++
++
++def explication_mois(anomalies, lignes_rapprochement, points_tendance, aerodrome, mois):
++    rapprochement = next((l for l in lignes_rapprochement if l["mois"] == mois and l["aerodrome"] == aerodrome), None)
++    point = next((p for p in points_tendance if p["mois"] == mois), None)
++    if rapprochement is None or point is None:
++        raise LookupError(f"Aucune donnée pour {aerodrome} en {mois}.")
++
++    phrases = [
++        f"En {mois_fr(mois)}, {aerodrome} compte {point['total_mouvements']} mouvements "
++        f"sur {point['jours_couverts']} jour(s), soit {nombre(point['moyenne_par_jour'])} par jour."
++    ]
++    if not point["mois_complet"]:
++        phrases.append("Mois incomplet : à ne pas comparer aux autres mois.")
++    if point["variation_mois_precedent_pct"] is not None:
++        phrases.append(f"Variation par rapport au mois précédent : {nombre(point['variation_mois_precedent_pct'])} %.")
++    if point["variation_annee_precedente_pct"] is not None:
++        phrases.append(f"Variation par rapport à l'an dernier : {nombre(point['variation_annee_precedente_pct'])} %.")
++
++    if rapprochement["agregat_brut"] is None:
++        phrases.append("Aucun agrégat fourni pour ce mois.")
++    elif rapprochement["ecart_agregat_vs_recalcul"] == 0:
++        phrases.append(f"L'agrégat brut ({rapprochement['agregat_brut']}) correspond au recalcul.")
++    else:
++        phrases.append(
++            f"L'agrégat brut ({rapprochement['agregat_brut']}) ne correspond pas au recalcul "
++            f"({rapprochement['recalcul_brut']})."
++        )
++    phrases.append(rapprochement["commentaire"])
++    if rapprochement["impact_nettoyage"]:
++        phrases.append(f"Le nettoyage change le total de {rapprochement['impact_nettoyage']:+d} mouvements.")
++
++    du_mois = [a for a in anomalies if a["aerodrome"] == aerodrome and a["mois"] == mois]
++    phrases += [phrase(a["detail"]) for a in du_mois]
++
++    return {
++        "titre": f"{aerodrome}, {mois_fr(mois)}",
++        "explication": " ".join(phrases),
++        "chiffres": {**point, "rapprochement": rapprochement},
++        "anomalies": du_mois,
++        "actions_conseillees": actions(du_mois),
++    }
+diff --git a/backend/app/fichiers.py b/backend/app/fichiers.py
+new file mode 100644
+index 0000000..7bb70fa
+--- /dev/null
++++ b/backend/app/fichiers.py
+@@ -0,0 +1,59 @@
++import io
++import re
++import unicodedata
++from pathlib import Path
++
++import pandas as pd
++
++from . import traitement
++
++EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xlsm"}
++
++TYPES = {
++    "trafic": (traitement.CLE + traitement.VALEURS, traitement.preparer_trafic),
++    "agregats": (["mois", "aerodrome", "mouvements_bruts"], traitement.preparer_agregats),
++    "referentiel": (["code", "base_mouvements_jour"], traitement.preparer_referentiel),
++}
++
++
++def norme(nom):
++    texte = unicodedata.normalize("NFKD", str(nom)).encode("ascii", "ignore").decode().lower()
++    return re.sub(r"[^a-z0-9]+", "_", texte).strip("_")
++
++
++def lire_tables(contenu, nom):
++    extension = Path(nom or "").suffix.lower()
++    if extension not in EXTENSIONS:
++        raise ValueError(f"Format non accepté ({extension or 'inconnu'}). Formats : {', '.join(sorted(EXTENSIONS))}")
++    try:
++        if extension in (".xlsx", ".xlsm"):
++            tables = list(pd.read_excel(io.BytesIO(contenu), sheet_name=None).values())
++        else:
++            tables = [lire_texte(contenu)]
++    except Exception as erreur:
++        raise ValueError(f"Fichier illisible : {erreur}") from erreur
++    for table in tables:
++        table.columns = [norme(c) for c in table.columns]
++    return tables
++
++
++def lire_texte(contenu):
++    for encodage in ("utf-8-sig", "latin-1"):
++        try:
++            return pd.read_csv(io.BytesIO(contenu), sep=None, engine="python", encoding=encodage)
++        except UnicodeDecodeError:
++            continue
++    raise ValueError("encodage illisible")
++
++
++def classer(contenu, nom):
++    trouvees = {}
++    for table in lire_tables(contenu, nom):
++        for type_table, (colonnes, preparer) in TYPES.items():
++            if all(c in table.columns for c in colonnes):
++                trouvees[type_table] = preparer(table.dropna(how="all"))
++                break
++    if not trouvees:
++        attendu = " ; ".join(f"{t} : {', '.join(c)}" for t, (c, _) in TYPES.items())
++        raise ValueError(f"Aucune table reconnue. Colonnes attendues : {attendu}")
++    return trouvees
+diff --git a/backend/app/main.py b/backend/app/main.py
+index af7c4c9..e1d62cf 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1,24 +1,45 @@
++import os
++from datetime import date
+ from pathlib import Path
+ from typing import Literal
+ 
+-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
++from fastapi import FastAPI, File, HTTPException, Path as ParamChemin, Query, Request, UploadFile
++from fastapi.exceptions import RequestValidationError
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
+ from pydantic import BaseModel
++from starlette.exceptions import HTTPException as ErreurHTTP
+ 
+-from . import traitement
++from . import explication, fichiers, openapi_copilot, traitement
+ 
+ DOSSIER_DONNEES = Path(__file__).resolve().parent.parent / "data"
+ FORMAT_MOIS = r"^\d{4}-(0[1-9]|1[0-2])$"
+ 
+-TypeAnomalie = Literal["doublon", "mouvements_manquants", "retard_manquant", "mouvements_negatifs", "pic_atypique"]
++TypeAnomalie = Literal[
++    "doublon", "mouvements_manquants", "retard_manquant", "mouvements_negatifs",
++    "pic_atypique", "creux_atypique", "retard_aberrant", "jour_manquant",
++]
++
++# outils exposés à Copilot Studio (la décision humaine reste côté interface)
++OUTILS_COPILOT = [
++    "resume_donnees",
++    "tableau_de_bord",
++    "lister_aerodromes",
++    "controle_qualite",
++    "rapprochement_agregats",
++    "statistiques_trafic",
++    "tendances_mensuelles",
++    "explication_jour",
++    "explication_mois",
++]
+ 
+ 
+ class Etat:
+     def __init__(self):
+         self.fichier = "trafic_journalier_brut.csv"
+         self.donnees = traitement.lire_trafic(DOSSIER_DONNEES / self.fichier)
+-        self.agregats = traitement.lire_csv(DOSSIER_DONNEES / "agregats_mensuels_bruts.csv")
+-        self.referentiel = traitement.lire_csv(DOSSIER_DONNEES / "referentiel_aerodromes.csv")
++        self.agregats = traitement.preparer_agregats(traitement.lire_csv(DOSSIER_DONNEES / "agregats_mensuels_bruts.csv"))
++        self.referentiel = traitement.preparer_referentiel(traitement.lire_csv(DOSSIER_DONNEES / "referentiel_aerodromes.csv"))
+         self.decisions = {}
+ 
+     def anomalies(self):
+@@ -33,34 +54,43 @@ etat = Etat()
+ 
+ app = FastAPI(
+     title="API Trafic Aérien",
+-    version="1.0.0",
++    version="2.0.0",
+     description="Contrôle, analyse et explication des données de trafic aérien (données fictives).",
+ )
+ 
+-# ouvert à tous pour le prototype, à restreindre ensuite
+-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
++# ouvert à tous pour le prototype, à restreindre ensuite (variable CORS_ORIGINES)
++origines = [o.strip() for o in os.getenv("CORS_ORIGINES", "*").split(",") if o.strip()]
++app.add_middleware(CORSMiddleware, allow_origins=origines, allow_methods=["*"], allow_headers=["*"])
+ 
+ 
+-def verifier_aerodrome(code):
+-    codes = list(etat.referentiel["code"])
+-    if code and code not in codes:
+-        raise HTTPException(404, f"Aérodrome inconnu : {code}. Valeurs possibles : {', '.join(codes)}")
++# toutes les erreurs ont la forme {"detail": "texte"}
++@app.exception_handler(ErreurHTTP)
++async def erreur_http(requete: Request, erreur: ErreurHTTP):
++    return JSONResponse({"detail": str(erreur.detail)}, status_code=erreur.status_code)
+ 
+ 
+-@app.get("/health", operation_id="sante", summary="Vérifier que l'API répond", tags=["Général"])
+-def sante():
+-    return {"statut": "ok"}
++@app.exception_handler(LookupError)
++async def erreur_introuvable(requete: Request, erreur: LookupError):
++    return JSONResponse({"detail": str(erreur.args[0]) if erreur.args else "Introuvable"}, status_code=404)
+ 
+ 
+-@app.get("/aerodromes", operation_id="lister_aerodromes", summary="Liste des aérodromes", tags=["Général"])
+-def aerodromes():
+-    return etat.referentiel.to_dict(orient="records")
++@app.exception_handler(RequestValidationError)
++async def erreur_validation(requete: Request, erreur: RequestValidationError):
++    champs = []
++    for e in erreur.errors():
++        lieu = [str(p) for p in e["loc"] if p not in ("body", "query", "path")]
++        champs.append({"champ": ".".join(lieu) or "requête", "message": str(e["msg"])})
++    texte = "; ".join(f"{c['champ']} : {c['message']}" for c in champs)
++    return JSONResponse({"detail": f"Paramètres invalides : {texte}", "erreurs": champs}, status_code=422)
+ 
+ 
+-@app.get("/resume", operation_id="resume_donnees", summary="Vue d'ensemble des données", tags=["Analyse"])
+-def resume():
+-    """Période, volumes, anomalies par type et décisions en attente. À appeler en premier."""
+-    anomalies = etat.anomalies()
++def verifier_aerodrome(code):
++    codes = list(etat.referentiel["code"])
++    if code and code not in codes:
++        raise HTTPException(404, f"Aérodrome inconnu : {code}. Valeurs possibles : {', '.join(codes)}")
++
++
++def resume_donnees(anomalies):
+     par_type = {t: 0 for t in traitement.TYPES_ANOMALIES}
+     for a in anomalies:
+         par_type[a["type"]] += 1
+@@ -78,17 +108,84 @@ def resume():
+     }
+ 
+ 
+-@app.post("/donnees", operation_id="envoyer_donnees", summary="Remplacer le fichier de trafic", tags=["Données"])
++@app.get("/health", operation_id="sante", summary="Vérifier que l'API répond", tags=["Général"])
++def sante():
++    return {"statut": "ok"}
++
++
++@app.get("/aerodromes", operation_id="lister_aerodromes", summary="Liste des aérodromes", tags=["Général"])
++def aerodromes():
++    return traitement.vers_json(etat.referentiel)
++
++
++@app.get("/resume", operation_id="resume_donnees", summary="Vue d'ensemble des données", tags=["Analyse"])
++def resume():
++    """Période, volumes, anomalies par type et décisions en attente. À appeler en premier."""
++    return resume_donnees(etat.anomalies())
++
++
++@app.get("/tableau-de-bord", operation_id="tableau_de_bord", summary="Tout l'écran d'accueil en un appel", tags=["Analyse"])
++def tableau_de_bord():
++    """Résumé, classement des aérodromes, totaux mensuels du réseau et anomalies de gravité haute."""
++    anomalies = traitement.ajouter_decisions(etat.anomalies(), etat.decisions)
++    net = etat.net(anomalies)
++    return {
++        "resume": resume_donnees(anomalies),
++        "classement_aerodromes": traitement.classement_aerodromes(net, etat.referentiel),
++        "totaux_mensuels": traitement.totaux_mensuels(net),
++        "anomalies_hautes": [a for a in anomalies if a["gravite"] == "haute"],
++    }
++
++
++@app.post("/donnees", operation_id="envoyer_donnees", summary="Remplacer les données (CSV ou Excel)", tags=["Données"])
+ def envoyer_donnees(fichier: UploadFile = File(...)):
+-    """Charge un nouveau CSV de trafic. Les décisions déjà prises sont effacées."""
++    """Accepte un CSV ou un Excel. Le trafic, le référentiel et les agrégats sont reconnus d'après leurs colonnes.
++    Seules les tables trouvées sont remplacées. Si le trafic change, les décisions déjà prises sont effacées."""
+     try:
+-        nouvelles = traitement.lire_trafic(fichier.file)
+-    except Exception as erreur:
++        tables = fichiers.classer(fichier.file.read(), fichier.filename)
++    except ValueError as erreur:
+         raise HTTPException(422, f"Fichier invalide : {erreur}") from erreur
+-    etat.donnees = nouvelles
+-    etat.fichier = fichier.filename or "fichier_envoye.csv"
+-    etat.decisions.clear()
+-    return {"statut": "charge", "fichier": etat.fichier, "nombre_lignes": int(len(nouvelles))}
++    if "trafic" in tables:
++        etat.donnees = tables["trafic"]
++        etat.decisions.clear()
++        etat.fichier = fichier.filename
++    if "agregats" in tables:
++        etat.agregats = tables["agregats"]
++    if "referentiel" in tables:
++        etat.referentiel = tables["referentiel"]
++    return {"statut": "charge", "fichier": fichier.filename, "tables": {nom: int(len(t)) for nom, t in tables.items()}}
++
++
++@app.get("/lignes", operation_id="lister_lignes", summary="Lignes brutes avec leurs anomalies", tags=["Données"])
++def lignes(
++    aerodrome: str | None = Query(None, description="Ex. DAK-SIM"),
++    du: date | None = Query(None, description="Date minimale AAAA-MM-JJ"),
++    au: date | None = Query(None, description="Date maximale AAAA-MM-JJ"),
++    uniquement_anomalies: bool = Query(False, description="Garder les lignes qui ont une anomalie"),
++    limite: int = Query(100, ge=1, le=1000),
++    decalage: int = Query(0, ge=0),
++):
++    """Lignes du CSV, paginées. Chaque ligne porte la liste de ses anomalies."""
++    verifier_aerodrome(aerodrome)
++    par_ligne = {}
++    for a in etat.anomalies():
++        if a["index_ligne"] is not None:
++            par_ligne.setdefault(a["index_ligne"], []).append(a["type"])
++    d = etat.donnees
++    if aerodrome:
++        d = d[d["aerodrome"] == aerodrome]
++    if du:
++        d = d[d["date"] >= du.isoformat()]
++    if au:
++        d = d[d["date"] <= au.isoformat()]
++    if uniquement_anomalies:
++        d = d[d.index.isin(list(par_ligne))]
++    page = d.iloc[decalage:decalage + limite].drop(columns=["mois"])
++    resultat = traitement.vers_json(page)
++    for ligne, index in zip(resultat, page.index):
++        ligne["ligne_csv"] = int(index) + 2
++        ligne["anomalies"] = par_ligne.get(index, [])
++    return {"total": int(len(d)), "limite": limite, "decalage": decalage, "lignes": resultat}
+ 
+ 
+ @app.get("/controle", operation_id="controle_qualite", summary="Anomalies des données brutes", tags=["Analyse"])
+@@ -96,16 +193,13 @@ def controle(
+     type_anomalie: TypeAnomalie | None = Query(None, alias="type", description="Filtrer sur un type"),
+     aerodrome: str | None = Query(None, description="Ex. DAK-SIM"),
+ ):
+-    """Doublons, valeurs manquantes, mouvements négatifs et pics, avec le numéro de ligne du CSV."""
++    """Doublons, manquants, négatifs, pics, creux, retards aberrants et jours sans données."""
+     verifier_aerodrome(aerodrome)
+-    anomalies = etat.anomalies()
++    anomalies = traitement.ajouter_decisions(etat.anomalies(), etat.decisions)
+     if type_anomalie:
+         anomalies = [a for a in anomalies if a["type"] == type_anomalie]
+     if aerodrome:
+         anomalies = [a for a in anomalies if a["aerodrome"] == aerodrome]
+-    for a in anomalies:
+-        decision = etat.decisions.get(a["id"])
+-        a["decision"] = decision["decision"] if decision else None
+     return {"nombre_anomalies": len(anomalies), "anomalies": anomalies}
+ 
+ 
+@@ -116,15 +210,15 @@ def rapprochement(
+ ):
+     """Pour chaque mois et aérodrome : agrégat brut, recalcul, net, écart et explication."""
+     verifier_aerodrome(aerodrome)
+-    lignes = traitement.rapprochement(etat.donnees, etat.agregats, etat.anomalies(), etat.decisions)
++    resultat = traitement.rapprochement(etat.donnees, etat.agregats, etat.anomalies(), etat.decisions)
+     if aerodrome:
+-        lignes = [l for l in lignes if l["aerodrome"] == aerodrome]
++        resultat = [l for l in resultat if l["aerodrome"] == aerodrome]
+     if uniquement_ecarts:
+-        lignes = [l for l in lignes if l["statut"] != "ok"]
++        resultat = [l for l in resultat if l["statut"] != "ok"]
+     return {
+-        "nombre_lignes": len(lignes),
+-        "impact_total_nettoyage": sum(l["impact_nettoyage"] for l in lignes),
+-        "lignes": lignes,
++        "nombre_lignes": len(resultat),
++        "impact_total_nettoyage": sum(l["impact_nettoyage"] for l in resultat),
++        "lignes": resultat,
+     }
+ 
+ 
+@@ -133,22 +227,54 @@ def stats(
+     aerodrome: str | None = Query(None, description="Ex. DAK-SIM. Vide : tous les aérodromes"),
+     mois: str | None = Query(None, pattern=FORMAT_MOIS, description="AAAA-MM. Vide : toute la période"),
+ ):
+-    """Total, moyenne par jour, retard moyen, répartitions et écart au volume de référence."""
++    """Total, moyenne par jour, retard moyen pondéré, répartitions et écart au volume de référence."""
+     verifier_aerodrome(aerodrome)
+-    try:
+-        return traitement.statistiques(etat.net(), etat.referentiel, aerodrome, mois)
+-    except LookupError as erreur:
+-        raise HTTPException(404, str(erreur)) from erreur
++    return traitement.statistiques(etat.net(), etat.referentiel, aerodrome, mois)
+ 
+ 
+ @app.get("/tendances", operation_id="tendances_mensuelles", summary="Évolution mensuelle du trafic", tags=["Analyse"])
+ def tendances(aerodrome: str | None = Query(None, description="Ex. DAK-SIM. Vide : tous les aérodromes")):
+-    """Total par mois sur les données nettes. Les mois partiels sont signalés par mois_complet."""
++    """Total par mois, variation sur le mois précédent et sur l'an dernier (mois complets seulement)."""
+     verifier_aerodrome(aerodrome)
+-    try:
+-        return traitement.tendances(etat.net(), aerodrome)
+-    except LookupError as erreur:
+-        raise HTTPException(404, str(erreur)) from erreur
++    return traitement.tendances(etat.net(), aerodrome)
++
++
++@app.get(
++    "/explication/jour/{aerodrome}/{jour}",
++    operation_id="explication_jour",
++    summary="Explication en français d'une journée",
++    tags=["Explication"],
++)
++def explication_du_jour(
++    aerodrome: str = ParamChemin(..., description="Ex. DAK-SIM"),
++    jour: date = ParamChemin(..., description="AAAA-MM-JJ, ex. 2025-08-14"),
++):
++    """Trafic du jour comparé au niveau habituel, retard, anomalies, décision humaine et actions conseillées."""
++    verifier_aerodrome(aerodrome)
++    anomalies = traitement.ajouter_decisions(etat.anomalies(), etat.decisions)
++    return explication.explication_jour(
++        etat.donnees, etat.net(anomalies), anomalies, etat.referentiel, aerodrome, jour.isoformat()
++    )
++
++
++@app.get(
++    "/explication/mois/{aerodrome}/{mois}",
++    operation_id="explication_mois",
++    summary="Explication en français d'un mois",
++    tags=["Explication"],
++)
++def explication_du_mois(
++    aerodrome: str = ParamChemin(..., description="Ex. DAK-SIM"),
++    mois: str = ParamChemin(..., pattern=FORMAT_MOIS, description="AAAA-MM, ex. 2025-04"),
++):
++    """Trafic du mois, variations, rapprochement avec l'agrégat brut et anomalies du mois."""
++    verifier_aerodrome(aerodrome)
++    anomalies = traitement.ajouter_decisions(etat.anomalies(), etat.decisions)
++    net = etat.net(anomalies)
++    lignes_rapprochement = traitement.rapprochement(etat.donnees, etat.agregats, anomalies, etat.decisions)
++    return explication.explication_mois(
++        anomalies, lignes_rapprochement, traitement.tendances(net, aerodrome), aerodrome, mois
++    )
+ 
+ 
+ class Decision(BaseModel):
+@@ -159,13 +285,16 @@ class Decision(BaseModel):
+ @app.post(
+     "/anomalies/{anomalie_id}/decision",
+     operation_id="decider_anomalie",
+-    summary="Décision humaine sur une anomalie",
++    summary="Décision humaine sur un pic",
+     tags=["Validation humaine"],
+ )
+ def decider(anomalie_id: str, corps: Decision):
+-    """corriger : le pic est remplacé par la valeur de référence. conserver : le pic est réel."""
+-    if anomalie_id not in {a["id"] for a in etat.anomalies()}:
++    """corriger : le pic est remplacé par la valeur habituelle. conserver : le pic est réel."""
++    anomalie = next((a for a in etat.anomalies() if a["id"] == anomalie_id), None)
++    if anomalie is None:
+         raise HTTPException(404, f"Anomalie inconnue : {anomalie_id}")
++    if anomalie["type"] != "pic_atypique":
++        raise HTTPException(422, "Seuls les pics atypiques demandent une décision humaine")
+     etat.decisions[anomalie_id] = corps.model_dump()
+     return {"anomalie_id": anomalie_id, **etat.decisions[anomalie_id]}
+ 
+@@ -173,3 +302,26 @@ def decider(anomalie_id: str, corps: Decision):
+ @app.get("/decisions", operation_id="lister_decisions", summary="Décisions prises", tags=["Validation humaine"])
+ def decisions():
+     return [{"anomalie_id": cle, **valeur} for cle, valeur in etat.decisions.items()]
++
++
++# FastAPI produit de l'OpenAPI 3.1, Copilot Studio attend la 3.0
++def adresse_publique(requete=None):
++    adresse = os.getenv("URL_PUBLIQUE")
++    if adresse:
++        return adresse.rstrip("/")
++    return str(requete.base_url).rstrip("/") if requete else None
++
++
++def openapi_personnalise():
++    if not app.openapi_schema:
++        app.openapi_schema = openapi_copilot.vers_30(openapi_copilot.schema_complet(app), adresse_publique())
++    return app.openapi_schema
++
++
++app.openapi = openapi_personnalise
++
++
++@app.get("/copilot/openapi.json", include_in_schema=False)
++def openapi_pour_copilot(requete: Request):
++    reduit = openapi_copilot.garder_operations(openapi_copilot.schema_complet(app), OUTILS_COPILOT)
++    return openapi_copilot.vers_30(reduit, adresse_publique(requete))
+diff --git a/backend/app/openapi_copilot.py b/backend/app/openapi_copilot.py
+new file mode 100644
+index 0000000..1d57621
+--- /dev/null
++++ b/backend/app/openapi_copilot.py
+@@ -0,0 +1,80 @@
++import copy
++
++from fastapi.openapi.utils import get_openapi
++
++
++def schema_complet(app):
++    return get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
++
++
++def garder_operations(schema, identifiants):
++    schema = copy.deepcopy(schema)
++    chemins = {}
++    for chemin, item in schema["paths"].items():
++        gardees = {m: op for m, op in item.items() if op.get("operationId") in identifiants}
++        if gardees:
++            chemins[chemin] = gardees
++    schema["paths"] = chemins
++
++    composants = schema.get("components", {}).get("schemas", {})
++    utiles = set()
++
++    def parcourir(noeud):
++        if isinstance(noeud, dict):
++            ref = noeud.get("$ref")
++            if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
++                nom = ref.rsplit("/", 1)[1]
++                if nom not in utiles:
++                    utiles.add(nom)
++                    parcourir(composants.get(nom, {}))
++            for valeur in noeud.values():
++                parcourir(valeur)
++        elif isinstance(noeud, list):
++            for valeur in noeud:
++                parcourir(valeur)
++
++    parcourir(schema["paths"])
++    schema.setdefault("components", {})["schemas"] = {k: v for k, v in composants.items() if k in utiles}
++    return schema
++
++
++def convertir(noeud):
++    if isinstance(noeud, list):
++        return [convertir(x) for x in noeud]
++    if not isinstance(noeud, dict):
++        return noeud
++    noeud = {k: convertir(v) for k, v in noeud.items()}
++
++    for cle in ("anyOf", "oneOf"):
++        options = noeud.get(cle)
++        if isinstance(options, list) and any(isinstance(o, dict) and o.get("type") == "null" for o in options):
++            reste = [o for o in options if not (isinstance(o, dict) and o.get("type") == "null")]
++            noeud.pop(cle)
++            noeud["nullable"] = True
++            if len(reste) == 1:
++                if "$ref" in reste[0]:
++                    noeud["allOf"] = [reste[0]]
++                else:
++                    noeud.update(reste[0])
++            elif reste:
++                noeud[cle] = reste
++
++    if isinstance(noeud.get("examples"), list):
++        exemples = noeud.pop("examples")
++        if exemples:
++            noeud["example"] = exemples[0]
++    if "const" in noeud:
++        noeud["enum"] = [noeud.pop("const")]
++    if noeud.get("contentMediaType") == "application/octet-stream":
++        noeud.pop("contentMediaType")
++        noeud["format"] = "binary"
++    noeud.pop("contentEncoding", None)
++    return noeud
++
++
++def vers_30(schema, serveur=None):
++    sortie = convertir(copy.deepcopy(schema))
++    sortie["openapi"] = "3.0.3"
++    if serveur:
++        sortie["servers"] = [{"url": serveur}]
++    return sortie
+diff --git a/backend/app/traitement.py b/backend/app/traitement.py
+index 80e857c..2a64a36 100644
+--- a/backend/app/traitement.py
++++ b/backend/app/traitement.py
+@@ -2,30 +2,105 @@ import pandas as pd
+ 
+ CLE = ["date", "aerodrome", "type_mouvement", "categorie_vol", "origine_destination"]
+ VALEURS = ["nombre_mouvements", "retard_moyen_min"]
+-TYPES_ANOMALIES = ["doublon", "mouvements_manquants", "retard_manquant", "mouvements_negatifs", "pic_atypique"]
+-FACTEUR_PIC = 3
++TYPES_ANOMALIES = [
++    "doublon",
++    "mouvements_manquants",
++    "retard_manquant",
++    "mouvements_negatifs",
++    "pic_atypique",
++    "creux_atypique",
++    "retard_aberrant",
++    "jour_manquant",
++]
++A_RETIRER = ("doublon", "mouvements_manquants", "mouvements_negatifs")
++RETARD_MAX = 180
++FENETRE = "31D"
++ECART_ROBUSTE = 5
++RATIO_PIC = 2
++RATIO_CREUX = 0.5
++MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
++           "septembre", "octobre", "novembre", "décembre"]
++
++
++def nombre(valeur):
++    return f"{valeur:.1f}".replace(".", ",")
++
++
++def date_fr(jour):
++    return pd.Timestamp(jour).strftime("%d/%m/%Y")
++
++
++def mois_fr(mois):
++    annee, numero = mois.split("-")
++    return f"{MOIS_FR[int(numero) - 1]} {annee}"
++
++
++def jours_du_mois(mois):
++    return pd.Period(mois, freq="M").days_in_month
+ 
+ 
+ def lire_csv(source):
+     return pd.read_csv(source, encoding="utf-8-sig")
+ 
+ 
+-def lire_trafic(source):
+-    donnees = lire_csv(source)
+-    absentes = [c for c in CLE + VALEURS if c not in donnees.columns]
++def verifier_colonnes(donnees, colonnes):
++    absentes = [c for c in colonnes if c not in donnees.columns]
+     if absentes:
+         raise ValueError("colonnes manquantes : " + ", ".join(absentes))
+-    donnees["date"] = donnees["date"].astype(str)
++
++
++def preparer_trafic(donnees):
++    verifier_colonnes(donnees, CLE + VALEURS)
++    donnees = donnees.copy()
++    if pd.api.types.is_datetime64_any_dtype(donnees["date"]):
++        donnees["date"] = donnees["date"].dt.strftime("%Y-%m-%d")
++    else:
++        donnees["date"] = donnees["date"].astype(str).str[:10]
+     donnees["mois"] = donnees["date"].str[:7]
+     for colonne in VALEURS:
+         donnees[colonne] = pd.to_numeric(donnees[colonne], errors="coerce")
+     return donnees
+ 
+ 
++def preparer_agregats(donnees):
++    verifier_colonnes(donnees, ["mois", "aerodrome", "mouvements_bruts"])
++    donnees = donnees.copy()
++    donnees["mois"] = donnees["mois"].astype(str).str[:7]
++    for colonne in ["mouvements_bruts", "nombre_lignes"]:
++        if colonne in donnees.columns:
++            donnees[colonne] = pd.to_numeric(donnees[colonne], errors="coerce")
++    return donnees
++
++
++def preparer_referentiel(donnees):
++    verifier_colonnes(donnees, ["code", "base_mouvements_jour"])
++    donnees = donnees.copy()
++    donnees["base_mouvements_jour"] = pd.to_numeric(donnees["base_mouvements_jour"], errors="coerce")
++    return donnees
++
++
++def lire_trafic(source):
++    return preparer_trafic(lire_csv(source))
++
++
++def vers_json(donnees):
++    return donnees.astype(object).where(donnees.notna(), None).to_dict(orient="records")
++
++
++def plages(jours):
++    resultat = []
++    for jour in jours:
++        if resultat and (jour - resultat[-1][1]).days == 1:
++            resultat[-1][1] = jour
++        else:
++            resultat.append([jour, jour])
++    return resultat
++
++
+ def detecter_anomalies(donnees):
+     anomalies = []
+ 
+-    def ajouter(type_anomalie, i, gravite, detail, **autres):
++    def sur_ligne(type_anomalie, i, gravite, detail, **autres):
+         ligne = donnees.loc[i]
+         valeur = ligne["nombre_mouvements"]
+         anomalies.append(
+@@ -55,38 +130,84 @@ def detecter_anomalies(donnees):
+             detail = f"Identique à la ligne {origine + 2} du CSV"
+         else:
+             detail = f"Même clé que la ligne {origine + 2} du CSV mais valeurs différentes"
+-        ajouter("doublon", i, "moyenne", detail, ligne_originale_csv=int(origine) + 2, identique=identique)
++        sur_ligne("doublon", i, "moyenne", detail, ligne_originale_csv=int(origine) + 2, identique=identique)
+ 
+     for i in donnees.index[donnees["nombre_mouvements"].isna()]:
+-        ajouter("mouvements_manquants", i, "haute", "Nombre de mouvements absent, ligne exclue du net")
++        sur_ligne("mouvements_manquants", i, "haute", "Nombre de mouvements absent, ligne exclue du net")
+ 
+     for i in donnees.index[donnees["retard_moyen_min"].isna()]:
+-        ajouter("retard_manquant", i, "basse", "Retard moyen absent, ignoré dans les moyennes")
++        sur_ligne("retard_manquant", i, "basse", "Retard moyen absent, ignoré dans les moyennes")
+ 
+     for i in donnees.index[donnees["nombre_mouvements"] < 0]:
+-        ajouter("mouvements_negatifs", i, "haute", "Nombre de mouvements négatif, ligne exclue du net")
+-
+-    valides = donnees[donnees["nombre_mouvements"] >= 0]
+-    for aerodrome, groupe in valides.groupby("aerodrome"):
+-        q1, q3 = groupe["nombre_mouvements"].quantile([0.25, 0.75])
+-        seuil = q3 + FACTEUR_PIC * (q3 - q1)
+-        mediane = round(float(groupe["nombre_mouvements"].median()))
+-        for i in groupe.index[groupe["nombre_mouvements"] > seuil]:
+-            valeur = int(donnees.loc[i, "nombre_mouvements"])
+-            detail = (
+-                f"{valeur} mouvements pour environ {mediane} d'habitude (seuil {round(float(seuil))}). "
+-                "Erreur de saisie ou vrai événement, à valider par un humain."
++        sur_ligne("mouvements_negatifs", i, "haute", "Nombre de mouvements négatif, ligne exclue du net")
++
++    retards = donnees["retard_moyen_min"]
++    for i in donnees.index[(retards < 0) | (retards > RETARD_MAX)]:
++        detail = f"Retard moyen de {retards[i]:g} min, hors de 0 à {RETARD_MAX} min"
++        sur_ligne("retard_aberrant", i, "moyenne", detail)
++
++    valides = donnees[(donnees["nombre_mouvements"] >= 0) & ~donnees.duplicated(CLE)]
++    for (aerodrome, sens), groupe in valides.groupby(["aerodrome", "type_mouvement"]):
++        if len(groupe) < 10:
++            continue
++        groupe = groupe.assign(jour=pd.to_datetime(groupe["date"])).sort_values("jour")
++        serie = pd.Series(groupe["nombre_mouvements"].to_numpy(dtype=float), index=pd.DatetimeIndex(groupe["jour"]))
++        habituel = serie.rolling(FENETRE, center=True, min_periods=10).median()
++        ecart = serie - habituel
++        sigma = max(1.4826 * (ecart - ecart.median()).abs().median(), 1.0)
++        rapport = serie / habituel
++        pics = (ecart / sigma > ECART_ROBUSTE) & (rapport > RATIO_PIC)
++        creux = (ecart / sigma < -ECART_ROBUSTE) & (rapport < RATIO_CREUX)
++        for position, i in enumerate(groupe.index):
++            normal = round(float(habituel.iloc[position])) if pd.notna(habituel.iloc[position]) else None
++            valeur = int(serie.iloc[position])
++            if pics.iloc[position]:
++                detail = (
++                    f"{valeur} mouvements pour environ {normal} d'habitude "
++                    f"({nombre(float(rapport.iloc[position]))} fois). "
++                    "Erreur de saisie ou vrai événement, à valider par un humain."
++                )
++                sur_ligne("pic_atypique", i, "haute", detail, valeur_reference=normal)
++            elif creux.iloc[position]:
++                detail = f"{valeur} mouvements pour environ {normal} d'habitude. Panne, fermeture ou erreur de saisie."
++                sur_ligne("creux_atypique", i, "moyenne", detail, valeur_reference=normal)
++
++    for aerodrome, groupe in donnees.groupby("aerodrome"):
++        presents = set(pd.to_datetime(groupe["date"]))
++        absents = [j for j in pd.date_range(min(presents), max(presents)) if j not in presents]
++        for debut, fin in plages(absents):
++            duree = (fin - debut).days + 1
++            periode = date_fr(debut) if duree == 1 else f"du {date_fr(debut)} au {date_fr(fin)}"
++            anomalies.append(
++                {
++                    "id": f"jour_manquant-{aerodrome}-{debut.strftime('%Y-%m-%d')}",
++                    "type": "jour_manquant",
++                    "gravite": "moyenne",
++                    "index_ligne": None,
++                    "ligne_csv": None,
++                    "date": debut.strftime("%Y-%m-%d"),
++                    "mois": debut.strftime("%Y-%m"),
++                    "aerodrome": aerodrome,
++                    "nombre_mouvements": None,
++                    "detail": f"Aucune ligne {periode} ({duree} jour(s))",
++                }
+             )
+-            ajouter("pic_atypique", i, "haute", detail, valeur_reference=mediane, seuil=round(float(seuil), 1))
+ 
+     return anomalies
+ 
+ 
++def ajouter_decisions(anomalies, decisions):
++    for a in anomalies:
++        decision = decisions.get(a["id"])
++        a["decision"] = decision["decision"] if decision else None
++    return anomalies
++
++
+ def construire_net(donnees, anomalies, decisions):
+     net = donnees.copy()
+     a_retirer = set()
+     for a in anomalies:
+-        if a["type"] in ("doublon", "mouvements_manquants", "mouvements_negatifs"):
++        if a["type"] in A_RETIRER:
+             a_retirer.add(a["index_ligne"])
+         elif a["type"] == "pic_atypique":
+             decision = decisions.get(a["id"])
+@@ -98,18 +219,16 @@ def construire_net(donnees, anomalies, decisions):
+ def rapprochement(donnees, agregats, anomalies, decisions):
+     net = construire_net(donnees, anomalies, decisions)
+     cle = ["mois", "aerodrome"]
+-    tableau = (
+-        pd.concat(
+-            [
+-                agregats.set_index(cle)["mouvements_bruts"].rename("agregat"),
+-                donnees.groupby(cle)["nombre_mouvements"].sum().rename("recalcul"),
+-                net.groupby(cle)["nombre_mouvements"].sum().rename("net"),
+-            ],
+-            axis=1,
+-        )
+-        .reset_index()
+-        .sort_values(cle)
+-    )
++    utilisables = donnees[donnees["nombre_mouvements"] >= 0]
++    colonnes = [
++        agregats.set_index(cle)["mouvements_bruts"].rename("agregat"),
++        donnees.groupby(cle)["nombre_mouvements"].sum().rename("recalcul"),
++        net.groupby(cle)["nombre_mouvements"].sum().rename("net"),
++        utilisables.groupby(cle).size().rename("lignes_recalcul"),
++    ]
++    if "nombre_lignes" in agregats.columns:
++        colonnes.append(agregats.set_index(cle)["nombre_lignes"].rename("lignes_agregat"))
++    tableau = pd.concat(colonnes, axis=1).reset_index().sort_values(cle)
+ 
+     par_mois = {}
+     for a in anomalies:
+@@ -118,25 +237,35 @@ def rapprochement(donnees, agregats, anomalies, decisions):
+     lignes = []
+     for _, r in tableau.iterrows():
+         du_mois = par_mois.get((r["mois"], r["aerodrome"]), [])
+-        nombre = {}
++        par_type = {}
+         for a in du_mois:
+-            nombre[a["type"]] = nombre.get(a["type"], 0) + 1
++            par_type[a["type"]] = par_type.get(a["type"], 0) + 1
+ 
+         agregat = None if pd.isna(r["agregat"]) else int(r["agregat"])
+-        recalcul = int(r["recalcul"])
+-        net_mois = int(r["net"])
++        recalcul = 0 if pd.isna(r["recalcul"]) else int(r["recalcul"])
++        net_mois = 0 if pd.isna(r["net"]) else int(r["net"])
+         ecart = None if agregat is None else recalcul - agregat
+         negatifs = sum(a["nombre_mouvements"] for a in du_mois if a["type"] == "mouvements_negatifs")
++        lignes_agregat = r.get("lignes_agregat")
++        ecart_lignes = None
++        if lignes_agregat is not None and not pd.isna(lignes_agregat):
++            ecart_lignes = int(0 if pd.isna(r["lignes_recalcul"]) else r["lignes_recalcul"]) - int(lignes_agregat)
+ 
+         if agregat is None:
+             statut = "absent_des_agregats"
+             commentaire = "Mois présent dans les données mais sans agrégat (mois probablement incomplet)."
++        elif recalcul == 0 and agregat != 0:
++            statut = "agregat_sans_donnees"
++            commentaire = "Agrégat fourni sans aucune ligne journalière correspondante."
+         elif ecart != 0 and negatifs and ecart == negatifs:
+             statut = "ecart_explique"
+             commentaire = f"L'agrégat exclut la ligne négative ({negatifs}), d'où un écart de {abs(ecart)}."
+         elif ecart != 0:
+             statut = "ecart_a_expliquer"
+             commentaire = "Le recalcul ne correspond pas à l'agrégat."
++        elif ecart_lignes:
++            statut = "ecart_a_expliquer"
++            commentaire = f"Les mouvements correspondent mais pas le nombre de lignes (écart de {abs(ecart_lignes)})."
+         elif net_mois != recalcul:
+             statut = "corrige_par_nettoyage"
+             commentaire = "L'agrégat correspond aux données brutes, le nettoyage change le total."
+@@ -151,9 +280,10 @@ def rapprochement(donnees, agregats, anomalies, decisions):
+                 "agregat_brut": agregat,
+                 "recalcul_brut": recalcul,
+                 "ecart_agregat_vs_recalcul": ecart,
++                "ecart_nombre_lignes": ecart_lignes,
+                 "net": net_mois,
+                 "impact_nettoyage": net_mois - recalcul,
+-                "anomalies": nombre,
++                "anomalies": par_type,
+                 "statut": statut,
+                 "commentaire": commentaire,
+             }
+@@ -161,8 +291,12 @@ def rapprochement(donnees, agregats, anomalies, decisions):
+     return lignes
+ 
+ 
+-def jours_du_mois(mois):
+-    return pd.Period(mois, freq="M").days_in_month
++def retard_pondere(donnees):
++    d = donnees[donnees["retard_moyen_min"].notna() & (donnees["nombre_mouvements"] > 0)]
++    poids = d["nombre_mouvements"].sum()
++    if not poids:
++        return None
++    return round(float((d["retard_moyen_min"] * d["nombre_mouvements"]).sum() / poids), 1)
+ 
+ 
+ def statistiques(net, referentiel, aerodrome, mois):
+@@ -176,13 +310,12 @@ def statistiques(net, referentiel, aerodrome, mois):
+ 
+     total = int(d["nombre_mouvements"].sum())
+     jours = int(d["date"].nunique())
+-    retard = d["retard_moyen_min"].mean()
+     resultat = {
+         "perimetre": {"aerodrome": aerodrome or "TOUS", "mois": mois or "TOUS"},
+         "total_mouvements": total,
+         "jours_couverts": jours,
+         "moyenne_mouvements_par_jour": round(total / jours, 1),
+-        "retard_moyen_min": None if pd.isna(retard) else round(float(retard), 1),
++        "retard_moyen_min": retard_pondere(d),
+     }
+     for nom, colonne in [
+         ("par_type_mouvement", "type_mouvement"),
+@@ -203,18 +336,69 @@ def statistiques(net, referentiel, aerodrome, mois):
+     return resultat
+ 
+ 
++def decaler_mois(mois, nombre):
++    annee, numero = map(int, mois.split("-"))
++    n = annee * 12 + numero - 1 + nombre
++    return f"{n // 12}-{n % 12 + 1:02d}"
++
++
++def variation(valeur, ancienne):
++    return round(100 * (valeur - ancienne) / ancienne, 1) if ancienne else None
++
++
+ def tendances(net, aerodrome):
+     d = net[net["aerodrome"] == aerodrome] if aerodrome else net
+     if d.empty:
+         raise LookupError("Aucune donnée pour ce périmètre.")
+     par_mois = d.groupby("mois").agg(total=("nombre_mouvements", "sum"), jours=("date", "nunique"))
++    complets = {m: float(r["total"]) for m, r in par_mois.iterrows() if int(r["jours"]) == jours_du_mois(m)}
++    resultat = []
++    for mois, r in par_mois.iterrows():
++        complet = mois in complets
++        resultat.append(
++            {
++                "mois": mois,
++                "total_mouvements": int(r["total"]),
++                "jours_couverts": int(r["jours"]),
++                "mois_complet": complet,
++                "moyenne_par_jour": round(float(r["total"]) / int(r["jours"]), 1),
++                "variation_mois_precedent_pct": variation(complets[mois], complets.get(decaler_mois(mois, -1))) if complet else None,
++                "variation_annee_precedente_pct": variation(complets[mois], complets.get(decaler_mois(mois, -12))) if complet else None,
++            }
++        )
++    return resultat
++
++
++def classement_aerodromes(net, referentiel):
++    total_reseau = float(net["nombre_mouvements"].sum())
++    classement = []
++    for _, ref in referentiel.iterrows():
++        d = net[net["aerodrome"] == ref["code"]]
++        total = int(d["nombre_mouvements"].sum())
++        moyenne = round(total / d["date"].nunique(), 1) if len(d) else 0.0
++        base = None if pd.isna(ref["base_mouvements_jour"]) else int(ref["base_mouvements_jour"])
++        classement.append(
++            {
++                "aerodrome": ref["code"],
++                "nom": None if pd.isna(ref.get("nom_fictif")) else ref.get("nom_fictif"),
++                "total_mouvements": total,
++                "part_pct": round(100 * total / total_reseau, 1) if total_reseau else 0.0,
++                "moyenne_par_jour": moyenne,
++                "base_referentiel_par_jour": base,
++                "ecart_vs_base_pct": variation(moyenne, base),
++                "retard_moyen_min": retard_pondere(d),
++            }
++        )
++    return sorted(classement, key=lambda c: -c["total_mouvements"])
++
++
++def totaux_mensuels(net):
++    par_mois = net.groupby("mois").agg(total=("nombre_mouvements", "sum"), jours=("date", "nunique"))
+     return [
+         {
+             "mois": mois,
+             "total_mouvements": int(r["total"]),
+-            "jours_couverts": int(r["jours"]),
+             "mois_complet": int(r["jours"]) == jours_du_mois(mois),
+-            "moyenne_par_jour": round(float(r["total"]) / int(r["jours"]), 1),
+         }
+         for mois, r in par_mois.iterrows()
+     ]
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 3e38b1a..ecc6761 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,4 +1,5 @@
+ fastapi==0.165.0
+ uvicorn[standard]==0.54.0
+ pandas==3.1.1
++openpyxl==3.1.5
+ python-multipart==0.0.34
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 8773fac..0d64d36 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,3 +1,7 @@
++import io
++from pathlib import Path
++
++import pandas as pd
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+@@ -9,6 +13,7 @@ def etat_neuf():
+     main.etat = main.Etat()
+ 
+ 
++DONNEES = Path(__file__).resolve().parent.parent / "data"
+ client = TestClient(main.app)
+ 
+ 
+@@ -21,6 +26,19 @@ def test_aerodromes():
+     assert codes == ["DAK-SIM", "ABJ-SIM", "NIM-SIM", "LME-SIM"]
+ 
+ 
++def test_resume():
++    resume = client.get("/resume").json()
++    assert resume["total_mouvements_net"] == 110229
++    assert resume["decisions_humaines_en_attente"] == ["pic_atypique-1800"]
++
++
++def test_tableau_de_bord():
++    tableau = client.get("/tableau-de-bord").json()
++    assert set(tableau) == {"resume", "classement_aerodromes", "totaux_mensuels", "anomalies_hautes"}
++    assert tableau["classement_aerodromes"][0]["aerodrome"] == "DAK-SIM"
++    assert {a["type"] for a in tableau["anomalies_hautes"]} == {"mouvements_manquants", "mouvements_negatifs", "pic_atypique"}
++
++
+ def test_controle_trouve_les_anomalies():
+     types = sorted(a["type"] for a in client.get("/controle").json()["anomalies"])
+     assert types == [
+@@ -39,6 +57,14 @@ def test_pic_du_14_aout():
+     assert (pics[0]["aerodrome"], pics[0]["date"], pics[0]["nombre_mouvements"]) == ("DAK-SIM", "2025-08-14", 290)
+ 
+ 
++def test_lignes_avec_anomalies():
++    reponse = client.get("/lignes", params={"uniquement_anomalies": True}).json()
++    assert reponse["total"] == 6
++    assert all(ligne["anomalies"] for ligne in reponse["lignes"])
++    page = client.get("/lignes", params={"aerodrome": "DAK-SIM", "limite": 5, "decalage": 5}).json()
++    assert len(page["lignes"]) == 5 and page["lignes"][0]["ligne_csv"] == 19
++
++
+ def test_rapprochement_lome_avril():
+     lignes = client.get("/rapprochement").json()["lignes"]
+     lome = next(l for l in lignes if l["mois"] == "2025-04" and l["aerodrome"] == "LME-SIM")
+@@ -47,15 +73,51 @@ def test_rapprochement_lome_avril():
+ 
+ def test_decision_sur_le_pic():
+     params = {"aerodrome": "DAK-SIM", "mois": "2025-08"}
+-    avant = client.get("/stats", params=params).json()["total_mouvements"]
++    assert client.get("/stats", params=params).json()["total_mouvements"] == 2331
+     reponse = client.post("/anomalies/pic_atypique-1800/decision", json={"decision": "corriger"})
+     assert reponse.status_code == 200
+-    apres = client.get("/stats", params=params).json()["total_mouvements"]
+-    assert apres < avant
++    assert client.get("/stats", params=params).json()["total_mouvements"] == 2076
++    assert client.get("/resume").json()["decisions_humaines_en_attente"] == []
++    assert "valeur corrigée" in client.get("/explication/jour/DAK-SIM/2025-08-14").json()["explication"]
++
++
++def test_decision_refusee_hors_pic():
++    doublon = client.get("/controle", params={"type": "doublon"}).json()["anomalies"][0]["id"]
++    assert client.post(f"/anomalies/{doublon}/decision", json={"decision": "corriger"}).status_code == 422
++
++
++def test_explication_jour_et_mois():
++    jour = client.get("/explication/jour/DAK-SIM/2025-08-14").json()
++    assert "290" in jour["explication"] and jour["anomalies"][0]["type"] == "pic_atypique"
++    mois = client.get("/explication/mois/LME-SIM/2025-04").json()
++    assert "965" in mois["explication"] and "961" in mois["explication"]
++
++
++def test_envoi_excel():
++    sortie = io.BytesIO()
++    with pd.ExcelWriter(sortie) as classeur:
++        pd.read_csv(DONNEES / "trafic_journalier_brut.csv", encoding="utf-8-sig").to_excel(classeur, sheet_name="trafic", index=False)
++        pd.read_csv(DONNEES / "agregats_mensuels_bruts.csv", encoding="utf-8-sig").to_excel(classeur, sheet_name="agregats", index=False)
++    fichier = {"fichier": ("donnees.xlsx", sortie.getvalue(), "application/octet-stream")}
++    reponse = client.post("/donnees", files=fichier)
++    assert reponse.json()["tables"] == {"trafic": 4378, "agregats": 72}
++    assert client.get("/resume").json()["total_mouvements_net"] == 110229
++
++
++def test_spec_copilot():
++    spec = client.get("/copilot/openapi.json").json()
++    assert spec["openapi"] == "3.0.3"
++    identifiants = {op["operationId"] for chemin in spec["paths"].values() for op in chemin.values()}
++    assert identifiants == set(main.OUTILS_COPILOT)
++    assert client.get("/openapi.json").json()["openapi"] == "3.0.3"
+ 
+ 
+ def test_erreurs():
+     assert client.get("/stats", params={"aerodrome": "XXX"}).status_code == 404
+-    assert client.get("/stats", params={"mois": "2025-13"}).status_code == 422
++    mauvais_mois = client.get("/stats", params={"mois": "2025-13"})
++    assert mauvais_mois.status_code == 422 and isinstance(mauvais_mois.json()["detail"], str)
++    assert client.get("/explication/jour/DAK-SIM/2025-02-30").status_code == 422
++    assert client.get("/explication/jour/DAK-SIM/2030-01-01").status_code == 404
++    assert client.get("/route-inconnue").json() == {"detail": "Not Found"}
+     assert client.post("/anomalies/inconnue/decision", json={"decision": "corriger"}).status_code == 404
+     assert client.post("/donnees", files={"fichier": ("x.csv", b"a,b\n1,2\n", "text/csv")}).status_code == 422
+diff --git a/backend/tests/test_traitement.py b/backend/tests/test_traitement.py
+new file mode 100644
+index 0000000..5345c00
+--- /dev/null
++++ b/backend/tests/test_traitement.py
+@@ -0,0 +1,146 @@
++import io
++from pathlib import Path
++
++import pandas as pd
++
++from app import explication, fichiers, traitement
++
++DOSSIER = Path(__file__).resolve().parent.parent / "data"
++DONNEES = traitement.lire_trafic(DOSSIER / "trafic_journalier_brut.csv")
++AGREGATS = traitement.preparer_agregats(traitement.lire_csv(DOSSIER / "agregats_mensuels_bruts.csv"))
++REFERENTIEL = traitement.preparer_referentiel(traitement.lire_csv(DOSSIER / "referentiel_aerodromes.csv"))
++ANOMALIES = traitement.detecter_anomalies(DONNEES)
++PIC = next(a for a in ANOMALIES if a["type"] == "pic_atypique")
++
++
++def types(anomalies):
++    return sorted(a["type"] for a in anomalies)
++
++
++def test_anomalies_du_jeu_fourni():
++    assert types(ANOMALIES) == [
++        "doublon",
++        "doublon",
++        "mouvements_manquants",
++        "mouvements_negatifs",
++        "pic_atypique",
++        "retard_manquant",
++    ]
++
++
++def test_pic_du_14_aout():
++    assert (PIC["aerodrome"], PIC["date"], PIC["nombre_mouvements"], PIC["valeur_reference"]) == (
++        "DAK-SIM",
++        "2025-08-14",
++        290,
++        35,
++    )
++
++
++def test_totaux_nets():
++    net = traitement.construire_net(DONNEES, ANOMALIES, {})
++    assert int(DONNEES["nombre_mouvements"].sum()) == 110266
++    assert int(net["nombre_mouvements"].sum()) == 110229
++
++
++def test_decision_corriger_remplace_le_pic():
++    for decisions, attendu in [({}, 2331), ({PIC["id"]: {"decision": "corriger"}}, 2076), ({PIC["id"]: {"decision": "conserver"}}, 2331)]:
++        net = traitement.construire_net(DONNEES, ANOMALIES, decisions)
++        stats = traitement.statistiques(net, REFERENTIEL, "DAK-SIM", "2025-08")
++        assert stats["total_mouvements"] == attendu
++
++
++def test_rapprochement_lome_avril():
++    lignes = traitement.rapprochement(DONNEES, AGREGATS, ANOMALIES, {})
++    lome = next(l for l in lignes if l["mois"] == "2025-04" and l["aerodrome"] == "LME-SIM")
++    assert (lome["agregat_brut"], lome["recalcul_brut"], lome["net"], lome["statut"]) == (965, 961, 965, "ecart_explique")
++
++
++def test_rapprochement_juillet_2026_sans_agregat():
++    lignes = traitement.rapprochement(DONNEES, AGREGATS, ANOMALIES, {})
++    juillet = [l for l in lignes if l["mois"] == "2026-07"]
++    assert len(juillet) == 4
++    assert {l["statut"] for l in juillet} == {"absent_des_agregats"}
++
++
++def test_agregat_sans_donnees_ne_plante_pas():
++    sans_mars = DONNEES[DONNEES["mois"] != "2025-03"]
++    lignes = traitement.rapprochement(sans_mars, AGREGATS, traitement.detecter_anomalies(sans_mars), {})
++    mars = [l for l in lignes if l["mois"] == "2025-03"]
++    assert {l["statut"] for l in mars} == {"agregat_sans_donnees"}
++
++
++def test_jour_manquant_detecte():
++    trou = DONNEES[~((DONNEES["aerodrome"] == "NIM-SIM") & DONNEES["date"].between("2025-06-10", "2025-06-12"))]
++    manquants = [a for a in traitement.detecter_anomalies(trou) if a["type"] == "jour_manquant"]
++    assert [(a["aerodrome"], a["date"]) for a in manquants] == [("NIM-SIM", "2025-06-10")]
++    assert "3 jour(s)" in manquants[0]["detail"]
++
++
++def test_retard_aberrant_detecte():
++    modifie = DONNEES.copy()
++    modifie.loc[10, "retard_moyen_min"] = 400
++    aberrants = [a for a in traitement.detecter_anomalies(modifie) if a["type"] == "retard_aberrant"]
++    assert [a["index_ligne"] for a in aberrants] == [10]
++
++
++def test_tendances_variations():
++    net = traitement.construire_net(DONNEES, ANOMALIES, {})
++    mois = {p["mois"]: p for p in traitement.tendances(net, "DAK-SIM")}
++    assert mois["2026-07"]["mois_complet"] is False
++    assert mois["2026-07"]["variation_mois_precedent_pct"] is None
++    assert mois["2025-01"]["variation_annee_precedente_pct"] is None
++    assert mois["2026-02"]["variation_annee_precedente_pct"] == -4.6
++
++
++def test_classement_des_aerodromes():
++    net = traitement.construire_net(DONNEES, ANOMALIES, {})
++    classement = traitement.classement_aerodromes(net, REFERENTIEL)
++    assert [c["aerodrome"] for c in classement][0] == "DAK-SIM"
++    assert round(sum(c["part_pct"] for c in classement)) == 100
++
++
++def test_explication_du_pic():
++    anomalies = traitement.ajouter_decisions(ANOMALIES, {})
++    net = traitement.construire_net(DONNEES, anomalies, {})
++    texte = explication.explication_jour(DONNEES, net, anomalies, REFERENTIEL, "DAK-SIM", "2025-08-14")
++    assert "290" in texte["explication"]
++    assert "ne permettent pas d'en établir la cause" in texte["explication"]
++    assert texte["chiffres"]["effet_sur_le_mois"]["part_du_pic_pct"] == 12.4
++    assert any("decision" in action for action in texte["actions_conseillees"])
++
++
++def test_explication_apres_decision():
++    decisions = {PIC["id"]: {"decision": "corriger"}}
++    anomalies = traitement.ajouter_decisions(ANOMALIES, decisions)
++    net = traitement.construire_net(DONNEES, anomalies, decisions)
++    texte = explication.explication_jour(DONNEES, net, anomalies, REFERENTIEL, "DAK-SIM", "2025-08-14")
++    assert "valeur corrigée" in texte["explication"]
++    assert texte["chiffres"]["effet_sur_le_mois"]["part_du_pic_pct"] == 12.4
++
++
++def test_explication_du_mois_lome():
++    net = traitement.construire_net(DONNEES, ANOMALIES, {})
++    lignes = traitement.rapprochement(DONNEES, AGREGATS, ANOMALIES, {})
++    texte = explication.explication_mois(ANOMALIES, lignes, traitement.tendances(net, "LME-SIM"), "LME-SIM", "2025-04")
++    assert "965" in texte["explication"] and "961" in texte["explication"]
++    assert "négative" in texte["explication"]
++
++
++def test_import_excel_trois_feuilles():
++    sortie = io.BytesIO()
++    with pd.ExcelWriter(sortie) as classeur:
++        for nom, fichier in [("trafic", "trafic_journalier_brut"), ("agregats", "agregats_mensuels_bruts"), ("ref", "referentiel_aerodromes")]:
++            traitement.lire_csv(DOSSIER / f"{fichier}.csv").to_excel(classeur, sheet_name=nom, index=False)
++    tables = fichiers.classer(sortie.getvalue(), "donnees.xlsx")
++    assert {nom: len(t) for nom, t in tables.items()} == {"trafic": 4378, "agregats": 72, "referentiel": 4}
++    assert types(traitement.detecter_anomalies(tables["trafic"])) == types(ANOMALIES)
++
++
++def test_import_refuse_ce_qui_n_est_pas_reconnu():
++    for contenu, nom in [(b"a,b\n1,2\n", "x.csv"), (b"%PDF", "x.pdf")]:
++        try:
++            fichiers.classer(contenu, nom)
++        except ValueError:
++            continue
++        raise AssertionError(nom)
